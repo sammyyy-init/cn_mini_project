@@ -13,7 +13,7 @@
 
 typedef struct {
     int id, port;
-    uint64_t rx_pkts, rx_bytes, delay_ns;   /* updated by receiver thread */
+    uint64_t rx_pkts, rx_bytes, delay_ns, jitter_ns;   /* updated by receiver thread */
     uint32_t next_seq;                      /* highest seq seen + 1 */
     uint64_t last_pkts, last_bytes, last_delay, last_expected;  /* reporter only */
 } flow_t;
@@ -40,6 +40,8 @@ static void *receiver(void *arg)
     if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) { perror("bind"); close(fd); return NULL; }
 
     char buf[2048];
+    uint64_t prev_t = 0, prev_ts = 0;
+    double jit = 0.0;
     while (!stop_flag) {
         ssize_t n = recvfrom(fd, buf, sizeof buf, 0, NULL, NULL);
         if (n < HDR_SIZE) continue;         /* timeout or runt packet */
@@ -50,6 +52,14 @@ static void *receiver(void *arg)
         __atomic_fetch_add(&f->rx_pkts, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&f->rx_bytes, (uint64_t)n, __ATOMIC_RELAXED);
         __atomic_fetch_add(&f->delay_ns, t > ts ? t - ts : 0, __ATOMIC_RELAXED);
+        if (prev_t) {
+            int64_t d = (int64_t)(t - prev_t) - (int64_t)(ts - prev_ts);
+            int64_t ad = d < 0 ? -d : d;
+            jit += ((double)ad - jit) / 16.0;
+            __atomic_store_n(&f->jitter_ns, (uint64_t)jit, __ATOMIC_RELAXED);
+        }
+        prev_t = t;
+        prev_ts = ts;
         if (seq + 1 > f->next_seq)          /* only this thread writes it */
             __atomic_store_n(&f->next_seq, seq + 1, __ATOMIC_RELAXED);
     }
@@ -79,7 +89,7 @@ int main(int argc, char **argv)
 
     FILE *csv = fopen(out, "w");
     if (!csv) { perror("fopen"); return 1; }
-    fprintf(csv, "epoch_s,flow_id,rx_pkts,rx_bytes,rx_mbps,lost_pkts,loss_pct,avg_delay_ms\n");
+    fprintf(csv, "epoch_s,flow_id,rx_pkts,rx_bytes,rx_mbps,lost_pkts,loss_pct,avg_delay_ms,jitter_ms\n");
 
     pthread_t th[MAX_FLOWS];
     for (int i = 0; i < nflows; i++) {
@@ -109,11 +119,12 @@ int main(int argc, char **argv)
             uint64_t ddl = dl - f->last_delay, dex = ex - f->last_expected;
             int64_t lost = (int64_t)dex - (int64_t)dpk;
             if (lost < 0) lost = 0;
-            fprintf(csv, "%.3f,%d,%llu,%llu,%.4f,%lld,%.2f,%.3f\n", epoch, f->id,
+            fprintf(csv, "%.3f,%d,%llu,%llu,%.4f,%lld,%.2f,%.3f,%.4f\n", epoch, f->id,
                     (unsigned long long)dpk, (unsigned long long)dby,
                     dby * 8.0 / dt / 1e6, (long long)lost,
                     dex ? 100.0 * lost / dex : 0.0,
-                    dpk ? ddl / 1e6 / dpk : 0.0);
+                    dpk ? ddl / 1e6 / dpk : 0.0,
+                    __atomic_load_n(&f->jitter_ns, __ATOMIC_RELAXED) / 1e6);
             f->last_pkts = pk; f->last_bytes = by; f->last_delay = dl; f->last_expected = ex;
         }
         fflush(csv);
@@ -126,8 +137,9 @@ int main(int argc, char **argv)
         flow_t *f = &flows[i];
         if (!f->rx_pkts) continue;
         double loss = f->next_seq ? 100.0 * ((double)f->next_seq - f->rx_pkts) / f->next_seq : 0;
-        fprintf(stderr, "flow %d: rx=%llu pkts, %llu bytes, expected=%u, loss=%.2f%%\n", f->id,
-                (unsigned long long)f->rx_pkts, (unsigned long long)f->rx_bytes, f->next_seq, loss);
+        fprintf(stderr, "flow %d: rx=%llu pkts, %llu bytes, expected=%u, loss=%.2f%%, jitter=%.4f ms, delay=%.4f ms\n", f->id,
+                (unsigned long long)f->rx_pkts, (unsigned long long)f->rx_bytes, f->next_seq, loss,
+                f->jitter_ns / 1e6, f->delay_ns / 1e6 / f->rx_pkts);
     }
     fclose(csv);
     return 0;
