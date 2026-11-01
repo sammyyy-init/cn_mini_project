@@ -33,7 +33,8 @@ h2 (background) --100M--/   10 Mbps, 5 ms, queue 100   \--100M-- h4 (background 
 cn_mini_project/
 ├── controller/
 │   ├── l2_switch.py        learning switch, per-UDP-flow rules
-│   └── stats_monitor.py    flow and port statistics polling, writes CSVs
+│   ├── stats_monitor.py    flow and port statistics polling, writes CSVs
+│   └── congestion_guard.py loss/congestion/link-failure detection, writes events
 ├── topology/
 │   └── topo.py             standalone Mininet topology with CLI for manual testing
 ├── udp_app/
@@ -43,6 +44,8 @@ cn_mini_project/
 │   └── Makefile
 ├── run_experiment.py       builds the network and runs the full rate sweep
 ├── analyze.py              merges app and SDN results, makes the table and graphs
+├── scenarios.py            runs the challenging scenarios (congestion, packet loss, link failure)
+├── analyze_scenarios.py    graphs and summary table for the scenarios
 ├── README.md
 └── .gitignore
 ```
@@ -173,3 +176,28 @@ Everything is written to `results/`.
 | `throughput.png` | analyze.py | offered rate vs app, s1 and s2 throughput with the link capacity line |
 | `loss_jitter.png` | analyze.py | loss (app and SDN) and jitter vs offered rate |
 | `timeseries.png` | analyze.py | rate over time for one run, app vs s1 vs s2 |
+
+## Challenging scenarios and robustness
+
+Three failure scenarios are run on the same topology, each with a 20 s UDP flow from h1 to h3:
+
+| Scenario | How it is created | What the system does |
+|---|---|---|
+| Congestion | 15 Mbps offered into the 10 Mbps bottleneck | `congestion_guard.py` compares packet counts of the flow at s1 and s2, sees loss above 3% for 2 polls and raises a CONGESTION event; RECOVERED is logged when loss drops |
+| Packet loss | 8 Mbps offered, 5% random loss added on the bottleneck link | same detector, classified as PACKET_LOSS because the offered rate is below link capacity |
+| Link failure | s1-s2 link taken down at 6 s and restored at 12 s | LINK_DOWN and LINK_UP events come from OpenFlow port-status messages, loss during the outage is classified as LINK_FAILURE, traffic resumes after the link returns |
+
+The guard only observes and reports by default, so the normal experiment is unaffected. Optional mitigation: start Ryu with `GUARD_MITIGATE=1` and the guard installs an OpenFlow meter that rate-limits an offending flow at s1 (`GUARD_LIMIT_KBPS`, default 9000). Detection thresholds can be changed with `GUARD_LOSS_PCT`, `GUARD_CONFIRM` and `GUARD_LINK_MBPS`.
+
+Run (Ryu loads the guard as a third app):
+
+```
+ryu-manager controller/l2_switch.py controller/stats_monitor.py controller/congestion_guard.py
+sudo mn -c
+sudo python3 scenarios.py
+python3 analyze_scenarios.py
+```
+
+Options: `--only congestion,packet_loss,link_failure`, `--duration 20`, `--congestion-rate 15`, `--loss-rate 8`, `--loss-pct 5`, `--fail-at 6`, `--fail-for 6`.
+
+Outputs in `results/`: `scenarios.csv`, `sdn_events.csv`, `scn_*_server.csv`, `scenario_summary.csv` (loss, jitter, first alert, alert delay, traffic recovery time) and one graph per scenario, `scenario_congestion.png`, `scenario_packet_loss.png`, `scenario_link_failure.png`, with the detected events marked on the timeline.
